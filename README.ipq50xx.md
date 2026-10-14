@@ -370,7 +370,8 @@ the switch driver bound and the ports as they are on a stock image -
 `lan1`/`lan2`/`wan`, `br-lan` on the lan ports, `wan` (or `wan.35` for a
 PPPoE ISP) as the WAN device. The service
 switches the conduit's tag protocol to the switch's tag_8021q tagger before
-netifd runs - `qca-8021q` for `qca8k` (QCA8337), `rtl8365mb-8021q` for
+netifd runs - `qca-8021q` for `qca8k` (QCA8337, and the QCA8386 switch of
+the QCA8084 package on the Linksys SPNMX57 - untested there), `rtl8365mb-8021q` for
 `rtl8365mb` (RTL8367S), `an8855-8021q` for the Airoha AN8855 - so the switch
 talks to the CPU in plain 802.1Q, which the firmware parses, and after the
 arm `qca-dsa-nss` gives every port, bridge, VLAN of a VLAN-aware bridge and
