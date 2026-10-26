@@ -481,6 +481,8 @@ define KernelPackage/ath11k/install
 	$(INSTALL_BIN) ./files/qca-nss-pbuf$(NSS_PBUF_FLAVOUR).init $(1)/etc/init.d/qca-nss-pbuf
 	$(INSTALL_DATA) ./files/pbuf$(NSS_PBUF_FLAVOUR).uci $(1)/etc/config/pbuf
 	$(INSTALL_BIN) ./files/nss_diag.sh $(1)/usr/bin/nss_diag
+	$(if $(NSS_PBUF_FLAVOUR),,$(INSTALL_DIR) $(1)/etc/uci-defaults)
+	$(if $(NSS_PBUF_FLAVOUR),,$(INSTALL_DATA) ./files/pbuf-governor.defaults $(1)/etc/uci-defaults/95_pbuf_governor)
 endef
 endif
 
