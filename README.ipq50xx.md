@@ -89,7 +89,7 @@ NSS memory profiles are a build-time choice for the whole image:
 | group | boards | memory profile |
 |---|---|---|
 | `std` | 512 MB and 1 GB boards (the release notes list them) | ath11k 1G, NSS medium |
-| `256m` | Cudy P5, Ruijie RG-MA3063, TP-Link Archer AX53 v2, TP-Link EX511 v2, Xiaomi CR8806, Xiaomi Mi Router AX3000T v2 | ath11k 256M, NSS low |
+| `256m` | Cudy P5, Ruijie RG-MA3063, TP-Link Archer AX53 v2, TP-Link Archer AX58 v2, TP-Link EX511 v2, Xiaomi CR8806, Xiaomi Mi Router AX3000T v2 | ath11k 256M, NSS low |
 
 The exact configuration of each group is in `.github/ci/ipq50xx/` (`common.config`
 + `<group>.config` + `kmods-extra.config`) and, for a given release, in the
@@ -382,6 +382,16 @@ Also on the AN8855 in this mode:
   are untested.
 - Unknown unicast, multicast and broadcast floods include the CPU port, so the
   host sees flooded traffic of every port.
+
+On all three switches, an ordinary frame that a port of a bridge sends to the
+CPU also arrives in the bridge's VLAN, and the bridge files it under the first
+of its ports that forwards. Unicast does not suffer, since the switch forwards
+between its own ports by its own FDB, but IGMP/MLD snooping does: a membership
+report from one port is registered on another, and the group's traffic then
+misses the port that asked for it (measured on the QCA8337, VLAN-aware bridges
+included, [#48](https://github.com/kuncy7/openwrt-nss-edma/issues/48)). Leave
+`igmp_snooping` off on bridges over switch ports, as OpenWrt does by default;
+multicast is then flooded to every port of the bridge.
 
 A board whose switch is driven by `qca8k`, `rtl8365mb` or `an8855` gets the
 `dsa` topology on first boot, and **nothing about the wiring is configured**: the
