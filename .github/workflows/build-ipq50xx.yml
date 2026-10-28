@@ -297,10 +297,12 @@ jobs:
         run: |
           set -euo pipefail
           out="bin/targets/${TARGET}"
-          # initramfs-factory.ubi only where a board needs it to be upgraded at all (256m: Xiaomi)
+          # initramfs-factory.ubi only where a board needs it to be upgraded at all: the Xiaomi
+          # AX3000T v2. Other boards build one too (the Archer AX53/AX58 v2), but install otherwise.
           names=(-name 'openwrt-*-squashfs-sysupgrade.bin'); sums='sysupgrade\.bin'
           if [[ "$GROUP" == 256m ]]; then
-            names+=(-o -name 'openwrt-*-initramfs-factory.ubi'); sums+='|initramfs-factory\.ubi'
+            names+=(-o -name 'openwrt-*-xiaomi_mi-router-ax3000t-v2-initramfs-factory.ubi')
+            sums+='|xiaomi_mi-router-ax3000t-v2-initramfs-factory\.ubi'
           fi
           mapfile -t assets < <(find "$out" -maxdepth 1 -type f \( "${names[@]}" \))
           grep -E "$sums" "$out/sha256sums" >"sha256sums-${GROUP}.txt"
