@@ -15,7 +15,7 @@ msgstr "%s IPv4 / %s IPv6 / %s multicast"
 
 #: package/nss/luci-app-nss/htdocs/luci-static/resources/view/nss/status.js:131
 msgid "%s pkts/s (NSS→host)"
-msgstr "%s pakietów/-y (NSS→host)"
+msgstr "%s pakiety(-ów)/s (NSS→host)"
 
 #: package/nss/luci-app-nss/htdocs/luci-static/resources/view/nss/status.js:136
 msgid "Bridge offload (bridge-mgr)"
@@ -255,7 +255,7 @@ msgstr "nieaktywne"
 
 #: package/nss/luci-app-nss/htdocs/luci-static/resources/view/nss/status.js:146
 msgid "egress %s pkts / ingress %s pkts — %s marking rules"
-msgstr "wyjście: %s pakietów/-y / wejście: %s pakietów/-y — reguły oznaczania: %s"
+msgstr "wyjście: %s pakiety(-ów) / wejście: %s pakiety(-ów) — reguły oznaczania: %s"
 
 #: package/nss/luci-app-nss/htdocs/luci-static/resources/view/nss/status.js:66
 msgid "host mode"
