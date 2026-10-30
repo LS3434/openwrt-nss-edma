@@ -1,7 +1,7 @@
-From 5a33b4720bfe1eb0bd58a90cc2d9d45d2a5aa6d3 Mon Sep 17 00:00:00 2001
+From 6d6d9120b8851faa3e33bd48d59340881a75c985 Mon Sep 17 00:00:00 2001
 From: Mieczyslaw Nalewaj <namiltd@yahoo.com>
 Date: Sat, 19 Sep 2026 12:00:00 +0200
-Subject: [PATCH net-next v6 8/9] net: dsa: realtek: rtl8365mb: re-latch the
+Subject: [PATCH net-next v7 08/10] net: dsa: realtek: rtl8365mb: re-latch the
  family D SerDes
 
 The family D receiver latches on the DISABLE -> HSGMII edge in SDS_MISC
@@ -33,12 +33,15 @@ only tell afterwards, from the link-status bit, whether an edge took.
 
 The far-end MAC starts when its conduit is brought up, which DSA
 reports through ->conduit_state_change(), so an episode of re-latch
-attempts starts there. pcs_config() only arms the work, and starts an
-episode itself if the conduit is already up. The work re-arms itself
-after each edge; the next run checks whether the edge took, rather
-than waiting on a poll that will not come. When the conduit goes down
-the work is stopped, so a link without a far end is not reported as
-lost and not parked every 10 s.
+attempts starts there. Only the conduit of the CPU port that carries
+the SerDes (port 6) is considered: the chip can have a second CPU
+port on RGMII, and its conduit says nothing about the SerDes link.
+pcs_config() only arms the work, and starts an episode itself if that
+conduit is already up. The work re-arms itself after each edge; the
+next run checks whether the edge took, rather than waiting on a poll
+that will not come. When the conduit goes down the work is stopped, so
+a link without a far end is not reported as lost and not parked every
+10 s.
 
 Each attempt (park for 20 ms, then restore the target mode) is
 performed by a work item rather than from the callbacks, because the
@@ -96,9 +99,10 @@ is unreachable until then.
 Co-developed-by: Oleg Gavrilov <gabonpivovich@gmail.com>
 Signed-off-by: Oleg Gavrilov <gabonpivovich@gmail.com>
 Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
+Reviewed-by: Linus Walleij <linusw@kernel.org>
 ---
- drivers/net/dsa/realtek/rtl8365mb_main.c | 378 ++++++++++++++++++++++-
- 1 file changed, 363 insertions(+), 15 deletions(-)
+ drivers/net/dsa/realtek/rtl8365mb_main.c | 387 ++++++++++++++++++++++-
+ 1 file changed, 372 insertions(+), 15 deletions(-)
 
 --- a/drivers/net/dsa/realtek/rtl8365mb_main.c
 +++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
@@ -142,7 +146,7 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
  /* SerDes internal registers, accessed via the SDS_INDACS registers. The BMCR
   * data path reset holds BMCR_ANENABLE | BMCR_ISOLATE while toggling the
   * vendor-specific low bits from phase 1 to phase 2, which triggers a data path
-@@ -927,10 +953,22 @@ struct rtl8365mb_port {
+@@ -927,10 +953,23 @@ struct rtl8365mb_port {
   * @chip_info: chip-specific info about the attached switch
   * @cpu: CPU tagging and CPU port configuration for this chip
   * @mib_lock: prevent concurrent reads of MIB counters
@@ -150,8 +154,8 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
 + *		conduit_state_change(), which arm, start and stop the
 + *		re-latch work
 + * @sds_lock: serializes access to the shared SDS_INDACS ADR/CMD/DATA window,
-+ *            reachable both from phylink's PCS callbacks and from the
-+ *            family D SerDes re-latch work
++ *	      reachable both from phylink's PCS callbacks and from the
++ *	      family D SerDes re-latch work
   * @ports: per-port data
   * @pcs: PCS for the SerDes external interface
   * @sds_supported: SerDes tuning parameters match the chip option, so the
@@ -161,11 +165,12 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
 + * @sds_relatch_count: next attempt of the re-latch episode, 0 once latched
 + * @sds_misc_target_val: SDS_MISC_CFG_MASK fields the re-latch work restores
 + * @sds_relatch_armed: pcs_config() set up 2500base-x; the re-latch work may run
-+ * @sds_conduit_up: the CPU port conduit is admin and oper up
++ * @sds_conduit_up: the conduit of the CPU port that carries the SerDes (port 6)
++ *		    is admin and oper up
   *
   * Private data for this driver.
   */
-@@ -948,9 +986,17 @@ struct rtl8365mb {
+@@ -948,9 +987,17 @@ struct rtl8365mb {
  	const struct rtl8365mb_chip_info *chip_info;
  	struct rtl8365mb_cpu cpu;
  	struct mutex mib_lock;
@@ -183,7 +188,7 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
  };
  
  #define pcs_to_rtl8365mb(_pcs) container_of((_pcs), struct rtl8365mb, pcs)
-@@ -1292,43 +1338,53 @@ static int rtl8365mb_ext_config_rgmii(struct realtek_priv *priv, int port,
+@@ -1292,43 +1339,53 @@ static int rtl8365mb_ext_config_rgmii(st
  static int rtl8365mb_sds_write(struct realtek_priv *priv, u8 index,
  			       u16 addr, u16 data)
  {
@@ -246,7 +251,7 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
  
  	/* Wait for the indirect read to complete: the engine clears the BUSY
  	 * bit once the data register holds the result.
-@@ -1338,15 +1394,19 @@ static int rtl8365mb_sds_read(struct realtek_priv *priv, u8 index,
+@@ -1338,15 +1395,19 @@ static int rtl8365mb_sds_read(struct rea
  				       !(val & RTL8365MB_SDS_INDACS_CMD_BUSY_MASK),
  				       10, 1000);
  	if (ret)
@@ -269,7 +274,7 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
  }
  
  /* The vendor driver selects between two sets of SerDes tuning parameters based
-@@ -1447,6 +1507,37 @@ static int rtl8365mb_sds_raise_rate_limits(struct realtek_priv *priv)
+@@ -1447,6 +1508,37 @@ static int rtl8365mb_sds_raise_rate_limi
  				  RTL8365MB_PORT6_EGRESSBW_CTRL1_MASK);
  }
  
@@ -307,7 +312,7 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
  static int rtl8365mb_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
  				phy_interface_t interface,
  				const unsigned long *advertising,
-@@ -1468,6 +1559,17 @@ static int rtl8365mb_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+@@ -1468,6 +1560,17 @@ static int rtl8365mb_pcs_config(struct p
  
  	is_d = rtl8365mb_get_family(priv) == RTL8365MB_FAMILY_D;
  
@@ -325,7 +330,7 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
  	/* Select the appropriate tuning table and SDS mode */
  	if (interface == PHY_INTERFACE_MODE_2500BASEX) {
  		if (is_d) {
-@@ -1557,7 +1659,9 @@ static int rtl8365mb_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+@@ -1557,7 +1660,9 @@ static int rtl8365mb_pcs_config(struct p
  	if (ret)
  		return ret;
  
@@ -336,7 +341,7 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
  		val = sds_mode << RTL8365MB_DIGITAL_INTERFACE_SELECT_MODE_OFFSET(id);
  		ret = regmap_update_bits(priv->map,
  					 RTL8365MB_DIGITAL_INTERFACE_SELECT_REG(id),
-@@ -1605,8 +1709,184 @@ static int rtl8365mb_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+@@ -1605,8 +1710,192 @@ static int rtl8365mb_pcs_config(struct p
  	val &= ~RTL8365MB_SDS_NWAY_EN_MASK;
  	val |= RTL8365MB_SDS_NWAY_RESTART_MASK;
  
@@ -368,10 +373,18 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
 +					   const struct net_device *conduit,
 +					   bool operational)
 +{
++	struct dsa_port *cpu_dp = conduit->dsa_ptr;
 +	struct realtek_priv *priv = ds->priv;
 +	struct rtl8365mb *mb = priv->chip_data;
 +
 +	if (rtl8365mb_get_family(priv) != RTL8365MB_FAMILY_D)
++		return;
++
++	/* The chip can have two CPU ports (SerDes on port 6, RGMII on
++	 * port 7) and DSA reports every conduit. Only the one behind the
++	 * SerDes matters here.
++	 */
++	if (cpu_dp->index != RTL8365MB_SDS_EXT_INTERFACE_PORT)
 +		return;
 +
 +	guard(mutex)(&mb->sds_cfg_lock);
@@ -523,7 +536,7 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
  }
  
  static bool rtl8365mb_interface_is_serdes(phy_interface_t interface)
-@@ -1760,11 +2040,25 @@ static void rtl8365mb_pcs_link_up(struct phylink_pcs *pcs,
+@@ -1760,11 +2049,25 @@ static void rtl8365mb_pcs_link_up(struct
  	}
  }
  
@@ -549,7 +562,7 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
  };
  
  static int rtl8365mb_ext_config_forcemode(struct realtek_priv *priv, int port,
-@@ -4015,6 +4309,14 @@ static int rtl8365mb_setup(struct dsa_switch *ds)
+@@ -4019,6 +4322,14 @@ out_error:
  static void rtl8365mb_teardown(struct dsa_switch *ds)
  {
  	struct realtek_priv *priv = ds->priv;
@@ -564,7 +577,7 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
  
  	rtl8365mb_stats_teardown(priv);
  	rtl8365mb_irq_teardown(priv);
-@@ -4047,6 +4349,23 @@ static int rtl8365mb_get_chip_id_and_ver(struct regmap *map, u32 *id, u32 *ver)
+@@ -4051,6 +4362,23 @@ static int rtl8365mb_get_chip_id_and_ver
  	return 0;
  }
  
@@ -588,7 +601,7 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
  static int rtl8365mb_detect(struct realtek_priv *priv)
  {
  	struct rtl8365mb *mb = priv->chip_data;
-@@ -4082,6 +4401,34 @@ static int rtl8365mb_detect(struct realtek_priv *priv)
+@@ -4086,6 +4414,34 @@ static int rtl8365mb_detect(struct realt
  
  	priv->num_ports = RTL8365MB_MAX_NUM_PORTS;
  	mb->priv = priv;
@@ -623,7 +636,7 @@ Signed-off-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
  	mb->cpu.trap_port = RTL8365MB_MAX_NUM_PORTS;
  	mb->cpu.insert = RTL8365MB_CPU_INSERT_TO_ALL;
  	mb->cpu.position = RTL8365MB_CPU_POS_AFTER_SA;
-@@ -4122,6 +4469,7 @@ static const struct dsa_switch_ops rtl8365mb_switch_ops = {
+@@ -4126,6 +4482,7 @@ static const struct dsa_switch_ops rtl83
  	.port_prechangeupper = rtl8365mb_port_prechangeupper,
  	.tag_8021q_vlan_add = rtl8365mb_tag_8021q_vlan_add,
  	.tag_8021q_vlan_del = rtl8365mb_tag_8021q_vlan_del,
