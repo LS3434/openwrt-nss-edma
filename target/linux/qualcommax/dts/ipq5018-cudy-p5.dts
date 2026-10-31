@@ -525,9 +525,20 @@
 };
 
 /*
+ * The QCN6122 (user-PD2) signals through the v2m0 doorbell using statically
+ * declared SPIs 448..460. Restrict PCI MSI allocation to 464..479 so the
+ * PCIe root port and the modem never get the QCN6122's vectors.
+ */
+&v2m0 {
+	arm,msi-base-spi = <464>;
+	arm,msi-num-spis = <16>;
+};
+
+/*
  * QCN6122 is managed by WCSS multi-PD firmware. Linux leaves PCIe0 at the
  * disabled state inherited from ipq5018.dtsi; the M.2 modem uses PCIe1.
  */
+
 &pcie1_phy {
 	status = "okay";
 };
