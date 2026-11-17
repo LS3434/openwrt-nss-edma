@@ -1,0 +1,746 @@
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 21:00:00 +0100
+Subject: [PATCH] net: dsa: qca8k: add QCA8386 support
+
+The QCA8386 ("Manhattan") is the QCA8084 quad-PHY package strapped as a
+switch: a QCA8337-family switch core with MAC0 (the CPU port, SGMII+ to
+the SoC over UNIPHY1) to MAC5, its user ports behind the package's own
+QCA8084 PHYs. The vendor SDK drives its MIB, VLAN, ATU and port lookup
+blocks with the QCA8337 (isisc) code, so the qca8k core logic applies as
+it is, including the qca-8021q tagger.
+
+What differs is how the chip is reached and powered:
+
+- The switch core sits at 0x0c000000 in the package's 32-bit address
+  space and is reached the way qca808x.c and nsscc-qca8k.c reach the rest
+  of it: page register 0x0c on pseudo-PHY 0x18, page = bits 23:8, PHY
+  0x10 | bits 7:5, register = bits 4:0, the upper half at reg | BIT(1).
+  The page register is shared with those two drivers, so it is written
+  on every access instead of cached, and, as they do, without a settle
+  delay after the write.
+- The switch core and the MAC datapath are clocked and reset by the
+  package's NSS clock controller (nsscc-qca8k). The resets are pulsed and
+  the clocks enabled in setup, before the first write - until then the
+  core's SRAM-backed registers read 0 and drop writes. Each MAC's tx/rx
+  clocks follow the link speed.
+- The CPU port's SerDes and the user ports' PHYs belong to the QCA8084
+  package driver: no qca8k PCS, no pad setup, no internal MDIO master,
+  no strap or LED register writes.
+- 2.5G uses the 1000 speed code in PORT_STATUS; the rate comes from the
+  SerDes and the clocks.
+- Six ports (CPU port 0, MAC5 unused here), not seven: ds->num_ports and
+  the loops that walked QCA8K_NUM_PORTS follow the match data.
+- Management and MIB autocast over Ethernet stay off; register access is
+  MDIO only.
+
+The chip handling (address scheme, reset and clock lists and order, the
+2.5G speed code) comes from the standalone qca8386 driver in openwrt/openwrt
+PR #25902 by Luca C, which was verified on a Linksys SPNMX57. Folding it
+into qca8k gives the chip FDB/MDB, VLAN-aware bridging, MIB statistics,
+LAG, mirroring and the qca-8021q tagger.
+---
+--- a/drivers/net/dsa/qca/qca8k-8xxx.c
++++ b/drivers/net/dsa/qca/qca8k-8xxx.c
+@@ -38,6 +38,42 @@ qca8k_split_addr(u32 regaddr, u16 *r1, u16 *r2, u16 *page)
+ 	*page = regaddr & 0x3ff;
+ }
+ 
++/* The QCA8386 switch core is not addressed like a QCA8337. It sits in the
++ * 32-bit address space of the QCA8084 package at 0x0c000000, and the package
++ * maps that space onto MDIO the way qca808x.c and nsscc-qca8k.c do for the
++ * rest of it: bits 31:24 pick the page register (0x0c here, on pseudo-PHY
++ * 0x18), bits 23:8 are the page, bits 7:5 the PHY address (0x10 | n), bits
++ * 4:0 the register, and the upper half of a word is at reg | BIT(1).
++ */
++#define QCA8386_MII_PAGE_REG				0x0c
++#define QCA8386_MII_REG_UPPER_16			BIT(1)
++
++struct qca8k_mii_addr {
++	u16 phy;
++	u16 lo;
++	u16 hi;
++	u16 page;
++};
++
++static void
++qca8k_mii_addr(struct qca8k_priv *priv, u32 regaddr, struct qca8k_mii_addr *a)
++{
++	u16 r1, r2;
++
++	if (qca8k_is_mht(priv)) {
++		a->lo = regaddr & 0x1f;
++		a->hi = a->lo | QCA8386_MII_REG_UPPER_16;
++		a->phy = 0x10 | ((regaddr >> 5) & 0x7);
++		a->page = (regaddr >> 8) & 0xffff;
++		return;
++	}
++
++	qca8k_split_addr(regaddr, &r1, &r2, &a->page);
++	a->lo = r1;
++	a->hi = r1 + 1;
++	a->phy = 0x10 | r2;
++}
++
+ static int
+ qca8k_mii_write_lo(struct mii_bus *bus, int phy_id, u32 regnum, u32 val)
+ {
+@@ -109,7 +145,8 @@ qca8k_mii_read_hi(struct mii_bus *bus, int phy_id, u32 regnum, u32 *val)
+ }
+ 
+ static int
+-qca8k_mii_read32(struct mii_bus *bus, int phy_id, u32 regnum, u32 *val)
++qca8k_mii_read32(struct mii_bus *bus, int phy_id, u32 regnum, u32 hi_regnum,
++		 u32 *val)
+ {
+ 	u32 hi, lo;
+ 	int ret;
+@@ -120,7 +157,7 @@ qca8k_mii_read32(struct mii_bus *bus, int phy_id, u32 regnum, u32 *val)
+ 	if (ret < 0)
+ 		goto err;
+ 
+-	ret = qca8k_mii_read_hi(bus, phy_id, regnum + 1, &hi);
++	ret = qca8k_mii_read_hi(bus, phy_id, hi_regnum, &hi);
+ 	if (ret < 0)
+ 		goto err;
+ 
+@@ -131,12 +168,13 @@ qca8k_mii_read32(struct mii_bus *bus, int phy_id, u32 regnum, u32 *val)
+ }
+ 
+ static void
+-qca8k_mii_write32(struct mii_bus *bus, int phy_id, u32 regnum, u32 val)
++qca8k_mii_write32(struct mii_bus *bus, int phy_id, u32 regnum, u32 hi_regnum,
++		  u32 val)
+ {
+ 	if (qca8k_mii_write_lo(bus, phy_id, regnum, val) < 0)
+ 		return;
+ 
+-	qca8k_mii_write_hi(bus, phy_id, regnum + 1, val);
++	qca8k_mii_write_hi(bus, phy_id, hi_regnum, val);
+ }
+ 
+ static int
+@@ -146,6 +184,19 @@ qca8k_set_page(struct qca8k_priv *priv, u16 page)
+ 	struct mii_bus *bus = priv->bus;
+ 	int ret;
+ 
++	/* The QCA8386's page register is the package's: the NSS clock
++	 * controller and the QCA8084 PHY package driver write it too, behind
++	 * our back, so it is written on every access, never cached. Like
++	 * those drivers, no settle time follows the write.
++	 */
++	if (qca8k_is_mht(priv)) {
++		ret = bus->write(bus, 0x18, QCA8386_MII_PAGE_REG, page);
++		if (ret < 0)
++			dev_err_ratelimited(&bus->dev,
++					    "failed to set qca8386 page\n");
++		return ret < 0 ? ret : 0;
++	}
++
+ 	if (page == *cached_page)
+ 		return 0;
+ 
+@@ -450,18 +501,18 @@ static int
+ qca8k_read_mii(struct qca8k_priv *priv, uint32_t reg, uint32_t *val)
+ {
+ 	struct mii_bus *bus = priv->bus;
+-	u16 r1, r2, page;
++	struct qca8k_mii_addr a;
+ 	int ret;
+ 
+-	qca8k_split_addr(reg, &r1, &r2, &page);
++	qca8k_mii_addr(priv, reg, &a);
+ 
+ 	mutex_lock_nested(&bus->mdio_lock, MDIO_MUTEX_NESTED);
+ 
+-	ret = qca8k_set_page(priv, page);
++	ret = qca8k_set_page(priv, a.page);
+ 	if (ret < 0)
+ 		goto exit;
+ 
+-	ret = qca8k_mii_read32(bus, 0x10 | r2, r1, val);
++	ret = qca8k_mii_read32(bus, a.phy, a.lo, a.hi, val);
+ 
+ exit:
+ 	mutex_unlock(&bus->mdio_lock);
+@@ -472,18 +523,18 @@ static int
+ qca8k_write_mii(struct qca8k_priv *priv, uint32_t reg, uint32_t val)
+ {
+ 	struct mii_bus *bus = priv->bus;
+-	u16 r1, r2, page;
++	struct qca8k_mii_addr a;
+ 	int ret;
+ 
+-	qca8k_split_addr(reg, &r1, &r2, &page);
++	qca8k_mii_addr(priv, reg, &a);
+ 
+ 	mutex_lock_nested(&bus->mdio_lock, MDIO_MUTEX_NESTED);
+ 
+-	ret = qca8k_set_page(priv, page);
++	ret = qca8k_set_page(priv, a.page);
+ 	if (ret < 0)
+ 		goto exit;
+ 
+-	qca8k_mii_write32(bus, 0x10 | r2, r1, val);
++	qca8k_mii_write32(bus, a.phy, a.lo, a.hi, val);
+ 
+ exit:
+ 	mutex_unlock(&bus->mdio_lock);
+@@ -495,25 +546,25 @@ qca8k_regmap_update_bits_mii(struct qca8k_priv *priv, uint32_t reg,
+ 			     uint32_t mask, uint32_t write_val)
+ {
+ 	struct mii_bus *bus = priv->bus;
+-	u16 r1, r2, page;
++	struct qca8k_mii_addr a;
+ 	u32 val;
+ 	int ret;
+ 
+-	qca8k_split_addr(reg, &r1, &r2, &page);
++	qca8k_mii_addr(priv, reg, &a);
+ 
+ 	mutex_lock_nested(&bus->mdio_lock, MDIO_MUTEX_NESTED);
+ 
+-	ret = qca8k_set_page(priv, page);
++	ret = qca8k_set_page(priv, a.page);
+ 	if (ret < 0)
+ 		goto exit;
+ 
+-	ret = qca8k_mii_read32(bus, 0x10 | r2, r1, &val);
++	ret = qca8k_mii_read32(bus, a.phy, a.lo, a.hi, &val);
+ 	if (ret < 0)
+ 		goto exit;
+ 
+ 	val &= ~mask;
+ 	val |= write_val;
+-	qca8k_mii_write32(bus, 0x10 | r2, r1, val);
++	qca8k_mii_write32(bus, a.phy, a.lo, a.hi, val);
+ 
+ exit:
+ 	mutex_unlock(&bus->mdio_lock);
+@@ -859,7 +910,7 @@ qca8k_mdio_write(struct qca8k_priv *priv, int phy, int regnum, u16 data)
+ 	if (ret)
+ 		goto exit;
+ 
+-	qca8k_mii_write32(bus, 0x10 | r2, r1, val);
++	qca8k_mii_write32(bus, 0x10 | r2, r1, r1 + 1, val);
+ 
+ 	ret = qca8k_mdio_busy_wait(bus, QCA8K_MDIO_MASTER_CTRL,
+ 				   QCA8K_MDIO_MASTER_BUSY);
+@@ -1298,6 +1349,10 @@ qca8k_phylink_mac_select_pcs(struct phylink_config *config,
+ 	struct phylink_pcs *pcs = NULL;
+ 	int port = dp->index;
+ 
++	/* The QCA8386 CPU port's SerDes belongs to the QCA8084 package */
++	if (qca8k_is_mht(priv))
++		return NULL;
++
+ 	switch (interface) {
+ 	case PHY_INTERFACE_MODE_SGMII:
+ 	case PHY_INTERFACE_MODE_1000BASEX:
+@@ -1332,6 +1387,12 @@ qca8k_phylink_mac_config(struct phylink_config *config, unsigned int mode,
+ 
+ 	priv = ds->priv;
+ 
++	/* Nothing to set up on a QCA8386: the package driver runs the CPU
++	 * port's SerDes and the user ports' PHYs.
++	 */
++	if (qca8k_is_mht(priv))
++		return;
++
+ 	switch (port) {
+ 	case 0: /* 1st CPU port */
+ 		if (state->interface != PHY_INTERFACE_MODE_RGMII &&
+@@ -1404,9 +1465,48 @@ qca8k_phylink_mac_config(struct phylink_config *config, unsigned int mode,
+ 	}
+ }
+ 
++static void qca8386_phylink_get_caps(int port, struct phylink_config *config)
++{
++	switch (port) {
++	case 0: /* CPU port, SGMII+ to the SoC */
++		__set_bit(PHY_INTERFACE_MODE_SGMII,
++			  config->supported_interfaces);
++		__set_bit(PHY_INTERFACE_MODE_2500BASEX,
++			  config->supported_interfaces);
++		break;
++
++	case 1:
++	case 2:
++	case 3:
++	case 4:
++		/* The package's QCA8084 PHYs. They report SGMII and
++		 * 2500base-x as their interfaces in switch mode.
++		 */
++		__set_bit(PHY_INTERFACE_MODE_INTERNAL,
++			  config->supported_interfaces);
++		__set_bit(PHY_INTERFACE_MODE_SGMII,
++			  config->supported_interfaces);
++		__set_bit(PHY_INTERFACE_MODE_2500BASEX,
++			  config->supported_interfaces);
++		break;
++
++	default:
++		/* Port 5 (UNIPHY0) is not wired up */
++		return;
++	}
++
++	config->mac_capabilities = MAC_ASYM_PAUSE | MAC_SYM_PAUSE |
++		MAC_10 | MAC_100 | MAC_1000FD | MAC_2500FD;
++}
++
+ static void qca8k_phylink_get_caps(struct dsa_switch *ds, int port,
+ 				   struct phylink_config *config)
+ {
++	if (qca8k_is_mht(ds->priv)) {
++		qca8386_phylink_get_caps(port, config);
++		return;
++	}
++
+ 	switch (port) {
+ 	case 0: /* 1st CPU port */
+ 		phy_interface_set_rgmii(config->supported_interfaces);
+@@ -1450,6 +1550,43 @@ qca8k_phylink_mac_link_down(struct phylink_config *config, unsigned int mode,
+ 	qca8k_port_set_status(priv, dp->index, 0);
+ }
+ 
++/* A QCA8386 MAC's datapath clocks run at the link's rate (the vendor's
++ * mht_port_speed_clock_set()); the RCGs pick their parents themselves.
++ */
++static void qca8386_port_clk_rate_set(struct qca8k_priv *priv, int port,
++				      int speed)
++{
++	struct clk_bulk_data *clks;
++	unsigned long rate;
++	int i, ret;
++
++	switch (speed) {
++	case SPEED_2500:
++		rate = 312500000;
++		break;
++	case SPEED_1000:
++		rate = 125000000;
++		break;
++	case SPEED_100:
++		rate = 25000000;
++		break;
++	case SPEED_10:
++		rate = 2500000;
++		break;
++	default:
++		return;
++	}
++
++	/* tx and rx, the first two of the port's clocks */
++	clks = &priv->mht->clks[port * QCA8386_CLKS_PER_PORT];
++	for (i = 0; i < 2; i++) {
++		ret = clk_set_rate(clks[i].clk, rate);
++		if (ret)
++			dev_warn(priv->dev, "port %d: %s to %lu Hz failed: %d\n",
++				 port, clks[i].id, rate, ret);
++	}
++}
++
+ static void
+ qca8k_phylink_mac_link_up(struct phylink_config *config,
+ 			  struct phy_device *phydev, unsigned int mode,
+@@ -1461,6 +1598,10 @@ qca8k_phylink_mac_link_up(struct phylink_config *config,
+ 	int port = dp->index;
+ 	u32 reg;
+ 
++	/* Retime the datapath before the MAC passes traffic */
++	if (qca8k_is_mht(priv))
++		qca8386_port_clk_rate_set(priv, port, speed);
++
+ 	if (phylink_autoneg_inband(mode)) {
+ 		reg = QCA8K_PORT_STATUS_LINK_AUTO;
+ 	} else {
+@@ -1474,6 +1615,12 @@ qca8k_phylink_mac_link_up(struct phylink_config *config,
+ 		case SPEED_1000:
+ 			reg = QCA8K_PORT_STATUS_SPEED_1000;
+ 			break;
++		case SPEED_2500:
++			/* QCA8386 only: the MAC takes the 1000 code, the rate
++			 * comes from the SerDes and the clocks set above.
++			 */
++			reg = QCA8K_PORT_STATUS_SPEED_1000;
++			break;
+ 		default:
+ 			reg = QCA8K_PORT_STATUS_LINK_AUTO;
+ 			break;
+@@ -1812,6 +1959,9 @@ static u32 qca8k_get_phy_flags(struct dsa_switch *ds, int port)
+ 	 * The first 2 bit are used to communicate the switch revision
+ 	 * to the phy driver.
+ 	 */
++	if (qca8k_is_mht(priv))
++		return 0;
++
+ 	if (port > 0 && port < 6)
+ 		return priv->switch_revision;
+ 
+@@ -1854,7 +2004,7 @@ qca8k_preferred_default_local_cpu_port(struct dsa_switch *ds)
+ 	if (dsa_is_cpu_port(ds, 0))
+ 		return dsa_to_port(ds, 0);
+ 
+-	if (dsa_is_cpu_port(ds, 6))
++	if (ds->num_ports > 6 && dsa_is_cpu_port(ds, 6))
+ 		return dsa_to_port(ds, 6);
+ 
+ 	return NULL;
+@@ -1990,8 +2140,11 @@ qca8k_conduit_change(struct dsa_switch *ds, const struct net_device *conduit,
+ 
+ 	/* Management over Ethernet rides on the Atheros header, which
+ 	 * tag_8021q has turned off in the switch; MDIO does the job then.
++	 * The QCA8386 is left on MDIO always: its management frames are
++	 * untested, and a register access that times out over Ethernet
++	 * costs more than the MDIO one it falls back to.
+ 	 */
+-	priv->mgmt_conduit = operational &&
++	priv->mgmt_conduit = operational && !qca8k_is_mht(priv) &&
+ 			     priv->tag_proto != DSA_TAG_PROTO_QCA_8021Q ?
+ 			     (struct net_device *)conduit : NULL;
+ 
+@@ -2380,20 +2533,121 @@ static void qca8k_get_stats64(struct dsa_switch *ds, int port,
+ 	spin_unlock_bh(&ms->lock);
+ }
+ 
++/* The switch core, MAC0..MAC5 TX/RX, in the order the vendor pulses them
++ * (qca_mht_switch_reset()).
++ */
++static const char * const qca8386_reset_names[QCA8386_NUM_RESETS] = {
++	"switch_core",
++	"mac0_tx", "mac0_rx",
++	"mac1_tx", "mac1_rx",
++	"mac2_tx", "mac2_rx",
++	"mac3_tx", "mac3_rx",
++	"mac4_tx", "mac4_rx",
++	"mac5_tx", "mac5_rx",
++};
++
++/* Four datapath clocks per port: tx, rx, then the two of the port's line
++ * side (SerDes on the CPU port, GEPHY on the user ports).
++ */
++static const char * const qca8386_clk_names[QCA8386_NUM_CLKS] = {
++	"mac0_tx", "mac0_rx", "mac0_tx_srds1", "mac0_rx_srds1",
++	"mac1_tx", "mac1_rx", "mac1_gephy_tx", "mac1_gephy_rx",
++	"mac2_tx", "mac2_rx", "mac2_gephy_tx", "mac2_gephy_rx",
++	"mac3_tx", "mac3_rx", "mac3_gephy_tx", "mac3_gephy_rx",
++	"mac4_tx", "mac4_rx", "mac4_gephy_tx", "mac4_gephy_rx",
++};
++
++/* Claimed at probe, so that the switch defers until the package's clock
++ * controller is there. The package reset GPIO is the clock controller's.
++ */
++static int qca8386_get_resources(struct qca8k_priv *priv)
++{
++	struct qca8k_mht *mht;
++	int i, ret;
++
++	mht = devm_kzalloc(priv->dev, sizeof(*mht), GFP_KERNEL);
++	if (!mht)
++		return -ENOMEM;
++
++	for (i = 0; i < QCA8386_NUM_RESETS; i++)
++		mht->resets[i].id = qca8386_reset_names[i];
++
++	ret = devm_reset_control_bulk_get_exclusive(priv->dev,
++						    QCA8386_NUM_RESETS,
++						    mht->resets);
++	if (ret)
++		return dev_err_probe(priv->dev, ret,
++				     "failed to get switch core/MAC resets\n");
++
++	for (i = 0; i < QCA8386_NUM_CLKS; i++)
++		mht->clks[i].id = qca8386_clk_names[i];
++
++	ret = devm_clk_bulk_get(priv->dev, QCA8386_NUM_CLKS, mht->clks);
++	if (ret)
++		return dev_err_probe(priv->dev, ret,
++				     "failed to get MAC datapath clocks\n");
++
++	priv->mht = mht;
++
++	return 0;
++}
++
++/* Until the switch core and the MACs have been through reset, the core's
++ * SRAM-backed registers read 0 and drop writes (the ID register answers
++ * regardless). The vendor resets them right before its switch init. The
++ * datapath clocks have no other consumer, so without this
++ * clk_disable_unused() turns them off and no frame moves.
++ */
++static int qca8386_power_up(struct qca8k_priv *priv)
++{
++	struct qca8k_mht *mht = priv->mht;
++	int ret;
++
++	ret = reset_control_bulk_reset(QCA8386_NUM_RESETS, mht->resets);
++	if (ret) {
++		dev_err(priv->dev, "failed to reset the switch core: %d\n", ret);
++		return ret;
++	}
++
++	usleep_range(1000, 2000);
++
++	ret = clk_bulk_prepare_enable(QCA8386_NUM_CLKS, mht->clks);
++	if (ret) {
++		dev_err(priv->dev, "failed to enable MAC clocks: %d\n", ret);
++		return ret;
++	}
++	mht->clks_on = true;
++
++	return 0;
++}
++
++static void qca8386_power_down(struct qca8k_priv *priv)
++{
++	struct qca8k_mht *mht = priv->mht;
++
++	if (!mht || !mht->clks_on)
++		return;
++
++	clk_bulk_disable_unprepare(QCA8386_NUM_CLKS, mht->clks);
++	mht->clks_on = false;
++}
++
+ static void qca8k_teardown(struct dsa_switch *ds)
+ {
+ 	struct qca8k_priv *priv = ds->priv;
+ 
+ 	cancel_delayed_work_sync(&priv->mib_stats.work);
++	qca8386_power_down(priv);
+ }
+ 
+-static int
+-qca8k_setup(struct dsa_switch *ds)
++/* What qca8k_setup() does to a QCA8337 before the common part and the
++ * QCA8386 has no use for: the RGMII/SGMII pads, the internal MDIO master
++ * (the user ports' PHYs are the package's, on the SoC's bus), the strap
++ * register and the LED controller (the package's PHYs drive the LEDs).
++ */
++static int qca8337_setup_board(struct qca8k_priv *priv)
+ {
+-	struct qca8k_priv *priv = ds->priv;
+-	struct dsa_port *dp;
+ 	int ret;
+-	u32 mask;
+ 
+ 	/* Parse CPU port config to be later used in phy_link mac_config */
+ 	ret = qca8k_parse_port_config(priv);
+@@ -2427,6 +2681,24 @@ qca8k_setup(struct dsa_switch *ds)
+ 		return ret;
+ 	}
+ 
++	return 0;
++}
++
++static int
++qca8k_setup_switch(struct dsa_switch *ds)
++{
++	struct qca8k_priv *priv = ds->priv;
++	struct dsa_port *dp;
++	int ret;
++	u32 mask;
++
++	if (qca8k_is_mht(priv))
++		ret = qca8386_power_up(priv);
++	else
++		ret = qca8337_setup_board(priv);
++	if (ret)
++		return ret;
++
+ 	/* Enable CPU Port */
+ 	ret = regmap_set_bits(priv->regmap, QCA8K_REG_GLOBAL_FW_CTRL0,
+ 			      QCA8K_GLOBAL_FW_CTRL0_CPU_PORT_EN);
+@@ -2566,6 +2838,19 @@ qca8k_setup(struct dsa_switch *ds)
+ 	return 0;
+ }
+ 
++static int
++qca8k_setup(struct dsa_switch *ds)
++{
++	struct qca8k_priv *priv = ds->priv;
++	int ret;
++
++	ret = qca8k_setup_switch(ds);
++	if (ret)
++		qca8386_power_down(priv);
++
++	return ret;
++}
++
+ static const struct phylink_mac_ops qca8k_phylink_mac_ops = {
+ 	.mac_select_pcs	= qca8k_phylink_mac_select_pcs,
+ 	.mac_config	= qca8k_phylink_mac_config,
+@@ -2636,6 +2921,14 @@ qca8k_sw_probe(struct mdio_device *mdiodev)
+ 	priv->bus = mdiodev->bus;
+ 	priv->dev = &mdiodev->dev;
+ 	priv->info = of_device_get_match_data(priv->dev);
++	if (!priv->info)
++		return -ENODEV;
++
++	if (qca8k_is_mht(priv)) {
++		ret = qca8386_get_resources(priv);
++		if (ret)
++			return ret;
++	}
+ 
+ 	priv->reset_gpio = devm_gpiod_get_optional(priv->dev, "reset",
+ 						   GPIOD_OUT_HIGH);
+@@ -2680,7 +2973,7 @@ qca8k_sw_probe(struct mdio_device *mdiodev)
+ 	INIT_DELAYED_WORK(&priv->mib_stats.work, qca8k_mib_stats_poll);
+ 
+ 	priv->ds->dev = &mdiodev->dev;
+-	priv->ds->num_ports = QCA8K_NUM_PORTS;
++	priv->ds->num_ports = priv->info->num_ports;
+ 	priv->ds->priv = priv;
+ 	priv->ds->ops = &qca8k_switch_ops;
+ 	priv->ds->phylink_mac_ops = &qca8k_phylink_mac_ops;
+@@ -2699,7 +2992,7 @@ qca8k_sw_remove(struct mdio_device *mdiodev)
+ 	if (!priv)
+ 		return;
+ 
+-	for (i = 0; i < QCA8K_NUM_PORTS; i++)
++	for (i = 0; i < priv->ds->num_ports; i++)
+ 		qca8k_port_set_status(priv, i, 0);
+ 
+ 	dsa_unregister_switch(priv->ds);
+@@ -2725,7 +3018,7 @@ qca8k_set_pm(struct qca8k_priv *priv, int enable)
+ {
+ 	int port;
+ 
+-	for (port = 0; port < QCA8K_NUM_PORTS; port++) {
++	for (port = 0; port < priv->ds->num_ports; port++) {
+ 		/* Do not enable on resume if the port was
+ 		 * disabled before.
+ 		 */
+@@ -2770,18 +3063,31 @@ static const struct qca8k_match_data qca8327 = {
+ 	.id = QCA8K_ID_QCA8327,
+ 	.reduced_package = true,
+ 	.mib_count = QCA8K_QCA832X_MIB_COUNT,
++	.num_ports = QCA8K_NUM_PORTS,
+ 	.ops = &qca8xxx_ops,
+ };
+ 
+ static const struct qca8k_match_data qca8328 = {
+ 	.id = QCA8K_ID_QCA8327,
+ 	.mib_count = QCA8K_QCA832X_MIB_COUNT,
++	.num_ports = QCA8K_NUM_PORTS,
+ 	.ops = &qca8xxx_ops,
+ };
+ 
+ static const struct qca8k_match_data qca833x = {
+ 	.id = QCA8K_ID_QCA8337,
+ 	.mib_count = QCA8K_QCA833X_MIB_COUNT,
++	.num_ports = QCA8K_NUM_PORTS,
++	.ops = &qca8xxx_ops,
++};
++
++/* The MIB, VLAN, ATU and port lookup blocks are the QCA8337's (the vendor
++ * SDK drives this chip with its isisc code).
++ */
++static const struct qca8k_match_data qca8386 = {
++	.id = QCA8K_ID_QCA8386,
++	.mib_count = QCA8K_QCA833X_MIB_COUNT,
++	.num_ports = QCA8386_NUM_PORTS,
+ 	.ops = &qca8xxx_ops,
+ };
+ 
+@@ -2790,6 +3096,7 @@ static const struct of_device_id qca8k_of_match[] = {
+ 	{ .compatible = "qca,qca8328", .data = &qca8328 },
+ 	{ .compatible = "qca,qca8334", .data = &qca833x },
+ 	{ .compatible = "qca,qca8337", .data = &qca833x },
++	{ .compatible = "qca,qca8386", .data = &qca8386 },
+ 	{ /* sentinel */ },
+ };
+ 
+--- a/drivers/net/dsa/qca/qca8k-common.c
++++ b/drivers/net/dsa/qca/qca8k-common.c
+@@ -446,7 +446,7 @@ static int qca8k_vlan_del(struct qca8k_priv *priv, u8 port, u16 vid)
+ 
+ 	/* Check if we're the last member to be removed */
+ 	del = true;
+-	for (i = 0; i < QCA8K_NUM_PORTS; i++) {
++	for (i = 0; i < priv->ds->num_ports; i++) {
+ 		mask = QCA8K_VTU_FUNC0_EG_MODE_PORT_NOT(i);
+ 
+ 		if ((reg & mask) != mask) {
+@@ -675,7 +675,7 @@ static int qca8k_update_port_member(struct qca8k_priv *priv, int port,
+ 	u32 port_mask = BIT(dp->cpu_dp->index);
+ 	int i, ret;
+ 
+-	for (i = 0; i < QCA8K_NUM_PORTS; i++) {
++	for (i = 0; i < priv->ds->num_ports; i++) {
+ 		if (i == port)
+ 			continue;
+ 		if (dsa_is_cpu_port(priv->ds, i))
+--- a/drivers/net/dsa/qca/qca8k.h
++++ b/drivers/net/dsa/qca/qca8k.h
+@@ -13,6 +13,8 @@
+ #include <linux/gpio.h>
+ #include <linux/if_vlan.h>
+ #include <linux/leds.h>
++#include <linux/clk.h>
++#include <linux/reset.h>
+ #include <linux/dsa/tag_qca.h>
+ 
+ #define QCA8K_ETHERNET_MDIO_PRIORITY			7
+@@ -29,6 +31,12 @@
+ #define QCA8K_ID_QCA8327				0x12
+ #define PHY_ID_QCA8337					0x004dd036
+ #define QCA8K_ID_QCA8337				0x13
++/* The switch core of the QCA8386 ("Manhattan", MHT) package: the QCA8337
++ * register map with MAC0 (CPU, SerDes) to MAC5, the four user ports behind
++ * the package's own QCA8084 PHYs, reached over the SoC's MDIO bus.
++ */
++#define QCA8K_ID_QCA8386				0x17
++#define QCA8386_NUM_PORTS				6
+ 
+ #define QCA8K_QCA832X_MIB_COUNT				39
+ #define QCA8K_QCA833X_MIB_COUNT				41
+@@ -442,6 +450,7 @@ struct qca8k_match_data {
+ 	u8 id;
+ 	bool reduced_package;
+ 	u8 mib_count;
++	u8 num_ports;
+ 	const struct qca8k_info_ops *ops;
+ };
+ 
+@@ -503,6 +512,19 @@ struct qca8k_mdio_cache {
+ 	u16 page;
+ };
+ 
++/* The QCA8386 package's NSS clock controller feeds the switch core and the
++ * MAC datapaths; nothing else in the tree claims these.
++ */
++#define QCA8386_NUM_RESETS				13
++#define QCA8386_CLKS_PER_PORT				4
++#define QCA8386_NUM_CLKS				(5 * QCA8386_CLKS_PER_PORT)
++
++struct qca8k_mht {
++	struct reset_control_bulk_data resets[QCA8386_NUM_RESETS];
++	struct clk_bulk_data clks[QCA8386_NUM_CLKS];
++	bool clks_on;
++};
++
+ struct qca8k_pcs {
+ 	struct phylink_pcs pcs;
+ 	struct qca8k_priv *priv;
+@@ -553,6 +575,7 @@ struct qca8k_priv {
+ 	struct qca8k_pcs pcs_port_0;
+ 	struct qca8k_pcs pcs_port_6;
+ 	const struct qca8k_match_data *info;
++	struct qca8k_mht *mht; /* QCA8386 only */
+ 	struct qca8k_led ports_led[QCA8K_LED_COUNT];
+ 	/* The tagger in use: DSA_TAG_PROTO_QCA (Atheros header) or
+ 	 * DSA_TAG_PROTO_QCA_8021Q (tag_8021q, the switch's own VLAN tag).
+@@ -590,6 +613,11 @@ struct qca8k_fdb {
+ 	u8 mac[6];
+ };
+ 
++static inline bool qca8k_is_mht(struct qca8k_priv *priv)
++{
++	return priv->info->id == QCA8K_ID_QCA8386;
++}
++
+ static inline u32 qca8k_port_to_phy(int port)
+ {
+ 	/* From Andrew Lunn:
